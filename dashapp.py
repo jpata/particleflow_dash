@@ -583,14 +583,52 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
     elif parquet_data_global is None or not ('X_track' in parquet_data_global.fields and 'X_cluster' in parquet_data_global.fields): model_output_msg = "Parquet data (X_track/X_cluster) not available for MLPF model."
     elif not (0 <= current_event_idx < max_events_pq_global): model_output_msg = f"Event {current_event_idx} out of range for Parquet data. MLPF model not run."
 
+    # MODIFICATION START
     if attention_data:
-        attention_figures_children.append(html.H3("Attention Heatmaps", style={'textAlign': 'center', 'marginTop': '10px'}))
-        for name, attn_matrix in attention_data:
-            title = f"Attention: Layer {name} (Event {current_event_idx})"
-            attn_fig = create_attention_heatmap_figure(attn_matrix, title)
-            graph_div = html.Div([dcc.Graph(figure=attn_fig, style={'height': '40vh', 'minHeight': '300px'})], style={'marginBottom': '15px'})
-            attention_figures_children.append(graph_div)
-    else: attention_figures_children.append(html.P("No attention data captured or available for this event.", style={'textAlign': 'center'}))
+        attention_figures_children.append(html.H3("Attention Heatmaps", style={'textAlign': 'center', 'marginTop': '20px', 'marginBottom': '10px'}))
+
+        conv_id_attentions = [(name, matrix) for name, matrix in attention_data if name.startswith("conv_id")]
+        conv_reg_attentions = [(name, matrix) for name, matrix in attention_data if name.startswith("conv_reg")]
+
+        processed_any_attention_group = False
+
+        if conv_id_attentions:
+            processed_any_attention_group = True
+            attention_figures_children.append(html.H4("Convolutional Identification Layers (conv_id)", style={'textAlign': 'center', 'marginTop': '15px', 'marginBottom': '5px'}))
+            conv_id_row_children = []
+            for name, attn_matrix in conv_id_attentions:
+                title = f"Attention: {name} (Event {current_event_idx})"
+                attn_fig = create_attention_heatmap_figure(attn_matrix, title)
+                # Style for individual graph containers within a row
+                graph_container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': '30%'} # Adjust maxWidth as needed
+                graph_style = {'height': '40vh', 'minHeight': '300px'}
+                conv_id_row_children.append(
+                    html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=graph_container_style)
+                )
+            # Row div for conv_id heatmaps
+            attention_figures_children.append(html.Div(conv_id_row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
+
+        if conv_reg_attentions:
+            processed_any_attention_group = True
+            attention_figures_children.append(html.H4("Convolutional Regression Layers (conv_reg)", style={'textAlign': 'center', 'marginTop': '15px', 'marginBottom': '5px'}))
+            conv_reg_row_children = []
+            for name, attn_matrix in conv_reg_attentions:
+                title = f"Attention: {name} (Event {current_event_idx})"
+                attn_fig = create_attention_heatmap_figure(attn_matrix, title)
+                graph_container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': '30%'} # Adjust maxWidth as needed
+                graph_style = {'height': '40vh', 'minHeight': '300px'}
+                conv_reg_row_children.append(
+                    html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=graph_container_style)
+                )
+            # Row div for conv_reg heatmaps
+            attention_figures_children.append(html.Div(conv_reg_row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
+
+        if not processed_any_attention_group and attention_data: # attention_data had items, but none matched conv_id or conv_reg
+             attention_figures_children.append(html.P("No 'conv_id' or 'conv_reg' specific attention data captured, though other attention data might exist.", style={'textAlign': 'center'}))
+
+    else: # attention_data is empty
+        attention_figures_children.append(html.P("No attention data captured or available for this event.", style={'textAlign': 'center'}))
+    # MODIFICATION END
 
     if parquet_data_global is not None and 0 <= current_event_idx < max_events_pq_global:
         try:
