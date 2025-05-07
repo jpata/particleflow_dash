@@ -37,7 +37,7 @@ config = SimpleNamespace(
     DEFAULT_B_FIELD_TESLA=-4.0,
     DEFAULT_SCALE_FACTOR=1000.0,
     DEFAULT_EVENT_INDEX=0,
-    DEFAULT_PT_CUT_GEV=1.0,
+    # DEFAULT_PT_CUT_GEV=1.0, # Removed pt cut
     PION_MASS_GEV=0.139570,
     C_LIGHT=3e8,
     DEFAULT_TRACK_COLLECTION_NAME="SiTracks_Refitted",
@@ -53,7 +53,7 @@ config = SimpleNamespace(
         "type", "energy", "energyError",
         "position.x", "position.y", "position.z"
     ],
-    DEFAULT_SHOW_PANDORA_CLUSTERS=True,
+    DEFAULT_SHOW_PANDORA_CLUSTERS=True, # This will be superseded by the new checklist
     PANDORA_CLUSTER_COLOR="cyan",
     TRACK_FEATURE_ORDER=[
         "elemtype", "pt", "eta", "sin_phi", "cos_phi", "p", "chi2", "ndf",
@@ -78,6 +78,10 @@ config.MODEL_CHECKPOINT_PATH = os.path.join(config.MODEL_DIR, "checkpoint-10-1.9
 captured_attentions_for_event: List[Tuple[str, NpArrayFloat]] = []
 original_mha_forwards_map: Dict[nn.MultiheadAttention, Any] = {}
 
+# --- Globals for Embedding Extraction via Hooks ---
+captured_embeddings_for_event: List[Tuple[str, NpArrayFloat]] = []
+
+
 def mha_forward_wrapper(layer_name: str, original_forward_method: callable, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs):
     """
     Wrapper for nn.MultiheadAttention.forward method.
@@ -85,33 +89,31 @@ def mha_forward_wrapper(layer_name: str, original_forward_method: callable, quer
     """
     global captured_attentions_for_event
 
-    # Ensure need_weights is True to get attention_output_weights
     kwargs['need_weights'] = True
-    # average_attn_weights=True is the default for nn.MultiheadAttention.forward,
-    # which returns weights averaged across heads: (N, L, S)
-    # If False, it returns (N, num_heads, L, S). We assume True for simplicity.
     kwargs['average_attn_weights'] = True
 
 
     attn_output, attn_output_weights = original_forward_method(query, key, value, **kwargs)
 
     if attn_output_weights is not None:
-        # Assuming batch size N=1 for inference, squeeze it if present.
-        # Resulting shape for attn_map_np: (L, S)
         if attn_output_weights.dim() == 3 and attn_output_weights.shape[0] == 1: # (1, L, S)
             attn_map_np = attn_output_weights[0].detach().cpu().numpy()
             captured_attentions_for_event.append((layer_name, attn_map_np))
         elif attn_output_weights.dim() == 2: # Already (L, S)
              attn_map_np = attn_output_weights.detach().cpu().numpy()
              captured_attentions_for_event.append((layer_name, attn_map_np))
-        # else:
-            # print(f"Debug MonkeyPatch: Unexpected attn_output_weights shape from {layer_name}: {attn_output_weights.shape}")
-
-
-    # CRITICAL: Return only the attention output, as the calling layer
-    # (e.g., PreLnSelfAttentionLayer) likely expects only one tensor if it
-    # originally called MHA with need_weights=False.
     return attn_output
+
+# --- Hook function for capturing embeddings ---
+def embedding_capture_hook(layer_name: str, module: nn.Module, input_tensor: Any, output_tensor: Any):
+    global captured_embeddings_for_event
+    if isinstance(output_tensor, torch.Tensor):
+        if output_tensor.dim() == 3 and output_tensor.shape[0] == 1: # (1, Seq_Len, Embedding_Dim)
+            embedding_np = output_tensor[0].detach().cpu().numpy()
+            captured_embeddings_for_event.append((layer_name, embedding_np))
+        elif output_tensor.dim() == 2: # Already (Seq_Len, Embedding_Dim)
+            embedding_np = output_tensor.detach().cpu().numpy()
+            captured_embeddings_for_event.append((layer_name, embedding_np))
 
 # --- Utility Functions ---
 def pad_and_concatenate_arrays(arr1: NpArrayFloat, arr2: NpArrayFloat) -> NpArrayFloat:
@@ -285,12 +287,12 @@ def extract_pandora_cluster_features(event_tree: uproot.TTree, event_index: int,
         branch_key_to_check = f"{collection_name}/{collection_name}.{original_feat_name}"; df_col_name = pandora_feature_to_df_col_map.get(original_feat_name, original_feat_name)
         if branch_key_to_check in pandora_event_data.fields and len(pandora_event_data[branch_key_to_check]) > 0: df_pandora_dict[df_col_name] = awkward.to_numpy(pandora_event_data[branch_key_to_check][0])
         else: df_pandora_dict[df_col_name] = np.zeros(num_clusters);
-        if df_col_name in ["x", "y", "z", "energy"]: all_essential_cols_present = False
+        if df_col_name in ["x", "y", "z", "energy"]: all_essential_cols_present = False # This condition seems wrong, should be if essential cols are MISSING
     return pd.DataFrame(df_pandora_dict)
 
-# --- ML Model Inference (Modified with Monkey-Patching) ---
+# --- ML Model Inference (Modified with Monkey-Patching and Hooks) ---
 MLPFOutput = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-MLPFInferenceResult = Tuple[Optional[MLPFOutput], str, List[Tuple[str, NpArrayFloat]]]
+MLPFInferenceResult = Tuple[Optional[MLPFOutput], str, List[Tuple[str, NpArrayFloat]], List[Tuple[str, NpArrayFloat]]] # preds, msg, attentions, embeddings
 
 def run_mlpf_inference(
     model: MLPF,
@@ -299,14 +301,16 @@ def run_mlpf_inference(
     x_cluster_event_np: NpArrayFloat,
     device: torch.device
 ) -> MLPFInferenceResult:
-    """Runs MLPF model inference, monkey-patching MHA layers to extract attention."""
+    """Runs MLPF model inference, monkey-patching MHA for attention & using hooks for embeddings."""
     global captured_attentions_for_event, original_mha_forwards_map
-    captured_attentions_for_event = [] # Clear for current event
-    original_mha_forwards_map.clear() # Clear any previous patches
+    global captured_embeddings_for_event # For hooks
+    captured_attentions_for_event = []
+    original_mha_forwards_map.clear()
+    captured_embeddings_for_event = [] # Clear for current event
 
     model_input_dim = model_kwargs.get("input_dim")
     if model_input_dim is None:
-        return None, "input_dim not found in MODEL_KWARGS", []
+        return None, "input_dim not found in MODEL_KWARGS", [], []
 
     def _ensure_2d_shape(arr: NpArrayFloat, target_dim: int) -> NpArrayFloat:
         if arr.ndim == 0: return np.empty((0, target_dim))
@@ -321,20 +325,20 @@ def run_mlpf_inference(
     x_cluster_np = _ensure_2d_shape(x_cluster_event_np, model_input_dim)
 
     if x_track_np.shape[0] == 0 and x_cluster_np.shape[0] == 0:
-        return None, "No track or cluster features to run MLPF model.", []
+        return None, "No track or cluster features to run MLPF model.", [], []
 
     combined_features_np = pad_and_concatenate_arrays(x_track_np, x_cluster_np)
     if combined_features_np.shape[0] == 0:
-        return None, "No combined features after processing for MLPF model.", []
+        return None, "No combined features after processing for MLPF model.", [], []
 
     model_input_tensor = torch.tensor(combined_features_np, dtype=torch.float32).unsqueeze(0).to(device)
     if model_input_tensor.shape[2] == 0:
-        return None, "Combined features tensor has 0 features, cannot create mask.", []
+        return None, "Combined features tensor has 0 features, cannot create mask.", [], []
     mask = (model_input_tensor[:, :, 0] != 0).to(device)
 
     # --- Setup MHA Monkey-Patching ---
     mha_layers_to_patch: List[Tuple[str, nn.MultiheadAttention]] = []
-    module_lists_names = ['conv_id', 'conv_reg'] # Add other potential ModuleLists here
+    module_lists_names = ['conv_id', 'conv_reg']
     for list_name in module_lists_names:
         if hasattr(model, list_name):
             module_list = getattr(model, list_name)
@@ -346,21 +350,33 @@ def run_mlpf_inference(
     for layer_name, mha_instance in mha_layers_to_patch:
         if mha_instance not in original_mha_forwards_map:
             original_mha_forwards_map[mha_instance] = mha_instance.forward
-            # The MHA.forward() signature is (query, key, value, key_padding_mask=None, need_weights=True, attn_mask=None, average_attn_weights=True)
-            # Our wrapper needs to match this, or use *args, **kwargs broadly.
-            # functools.partial helps pass static args (layer_name, original_method) to the wrapper.
-            # The actual q, k, v, etc., will be passed when the layer is called.
             mha_instance.forward = functools.partial(mha_forward_wrapper, layer_name, original_mha_forwards_map[mha_instance])
-    # --- End of MHA Monkey-Patching Setup ---
+
+    # --- Setup Forward Hooks for Embeddings ---
+    hooks = []
+    if hasattr(model, 'conv_id') and model.conv_id is not None and len(model.conv_id) > 0:
+        # Hook the last layer of the conv_id ModuleList
+        hook = model.conv_id[-1].register_forward_hook(
+            functools.partial(embedding_capture_hook, "final_conv_id_output")
+        )
+        hooks.append(hook)
+
+    if hasattr(model, 'conv_reg') and model.conv_reg is not None and len(model.conv_reg) > 0:
+        # Hook the last layer of the conv_reg ModuleList
+        hook = model.conv_reg[-1].register_forward_hook(
+            functools.partial(embedding_capture_hook, "final_conv_reg_output")
+        )
+        hooks.append(hook)
+    # --- End of Hook Setup ---
 
     preds_tuple: Optional[MLPFOutput] = None
     try:
         with torch.no_grad():
-            raw_model_output = model(model_input_tensor, mask) # This will invoke patched MHA forwards
+            raw_model_output = model(model_input_tensor, mask)
             if isinstance(raw_model_output, tuple) and len(raw_model_output) == 4 and \
                all(isinstance(p, torch.Tensor) for p in raw_model_output):
                 preds_tuple = raw_model_output
-            elif isinstance(raw_model_output, tuple) and len(raw_model_output) >= 4: # Fallback
+            elif isinstance(raw_model_output, tuple) and len(raw_model_output) >= 4:
                  preds_tuple = (raw_model_output[0], raw_model_output[1], raw_model_output[2], raw_model_output[3])
 
     finally:
@@ -368,12 +384,15 @@ def run_mlpf_inference(
         for mha_instance, original_forward in original_mha_forwards_map.items():
             mha_instance.forward = original_forward
         original_mha_forwards_map.clear()
-        # --- End of Restoration ---
+        # --- Remove Forward Hooks ---
+        for hook in hooks:
+            hook.remove()
 
-    attentions_to_return = list(captured_attentions_for_event) # Make a copy
+    attentions_to_return = list(captured_attentions_for_event)
+    embeddings_to_return = list(captured_embeddings_for_event) # Make a copy
 
     if preds_tuple is None:
-        return None, "Model prediction was not in the expected format or failed.", attentions_to_return
+        return None, "Model prediction was not in the expected format or failed.", attentions_to_return, embeddings_to_return
 
     preds_binary_particle, preds_pid, preds_momentum, preds_pu = preds_tuple
     output_msg = (
@@ -384,13 +403,17 @@ def run_mlpf_inference(
         f"  preds_pu shape: {preds_pu.shape}\n"
         f"  Number of input elements to model: {combined_features_np.shape[0]}"
     )
-    if not attentions_to_return:
-        output_msg += "\n  No attention matrices captured via monkey-patching."
+    if not attentions_to_return: output_msg += "\n  No attention matrices captured."
     else:
-        output_msg += f"\n  Captured {len(attentions_to_return)} attention matrices via monkey-patching:"
-        for name, attn in attentions_to_return:
-            output_msg += f"\n    - {name}: shape {attn.shape}"
-    return preds_tuple, output_msg, attentions_to_return
+        output_msg += f"\n  Captured {len(attentions_to_return)} attention matrices:"
+        for name, attn in attentions_to_return: output_msg += f"\n    - {name}: shape {attn.shape}"
+
+    if not embeddings_to_return: output_msg += "\n  No intermediate embeddings captured."
+    else:
+        output_msg += f"\n  Captured {len(embeddings_to_return)} intermediate embedding matrices:"
+        for name, emb in embeddings_to_return: output_msg += f"\n    - {name}: shape {emb.shape}"
+
+    return preds_tuple, output_msg, attentions_to_return, embeddings_to_return
 
 # --- Plotting Helper Functions ---
 def create_empty_heatmap_figure(title: str = "No Data / Error") -> go.Figure:
@@ -409,11 +432,10 @@ def create_feature_heatmap(data_np: NpArrayFloat, feature_order: List[str], titl
     return fig
 
 def create_attention_heatmap_figure(
-    attn_matrix_np: NpArrayFloat, # Should be 2D (Target_Seq_Len, Source_Seq_Len)
+    attn_matrix_np: NpArrayFloat,
     title: str,
     colorscale: str = 'Blues'
 ) -> go.Figure:
-    """Creates a heatmap figure for an attention matrix."""
     if not isinstance(attn_matrix_np, np.ndarray) or attn_matrix_np.ndim != 2 or \
        attn_matrix_np.shape[0] == 0 or attn_matrix_np.shape[1] == 0:
         fig = go.Figure().update_layout(title=f"{title} - No/Invalid Data (Shape: {attn_matrix_np.shape if isinstance(attn_matrix_np, np.ndarray) else 'N/A'})")
@@ -425,40 +447,63 @@ def create_attention_heatmap_figure(
     x_labels = [f'{i}' for i in range(source_seq_len)]
 
     fig = go.Figure(data=go.Heatmap(
-        z=attn_matrix_np,
-        x=x_labels,
+        z=attn_matrix_np, x=x_labels, y=y_labels, colorscale=colorscale,
+        colorbar=dict(title='Attention Weight'), xgap=0, ygap=0
+    ))
+    fig.update_layout(
+        title=title, xaxis_title="Source Sequence Elements (Key/Value)",
+        yaxis_title="Target Sequence Elements (Query)", xaxis_tickangle=-45,
+        yaxis_autorange='reversed',
+        yaxis=dict(scaleanchor="x", scaleratio=1, autorange='reversed'),
+        xaxis=dict(constrain='domain'),
+        margin=dict(l=100, r=20, b=120, t=50),
+    )
+    return fig
+
+def create_embedding_heatmap_figure(
+    embedding_matrix_np: NpArrayFloat,
+    title: str,
+    colorscale: str = 'RdBu'
+) -> go.Figure:
+    """Creates a heatmap figure for an embedding matrix."""
+    if not isinstance(embedding_matrix_np, np.ndarray) or embedding_matrix_np.ndim != 2 or \
+       embedding_matrix_np.shape[0] == 0 or embedding_matrix_np.shape[1] == 0:
+        fig = go.Figure().update_layout(title=f"{title} - No/Invalid Data (Shape: {embedding_matrix_np.shape if isinstance(embedding_matrix_np, np.ndarray) else 'N/A'})")
+        fig.add_annotation(text="Embedding data not available or invalid for heatmap.", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    seq_len, embedding_dim = embedding_matrix_np.shape
+    y_labels = [f' {i}' for i in range(seq_len)]
+    # Display only a subset of x_labels if embedding_dim is too large to avoid clutter
+    if embedding_dim > 50: # Heuristic: if more than 50 dims, label every 10th
+        x_labels_ticks = [f'Dim {j*10}' for j in range(embedding_dim // 10)]
+        x_labels_values = [j*10 for j in range(embedding_dim // 10)]
+        if embedding_dim % 10 != 0 : # Add last label if not perfectly divisible
+            x_labels_ticks.append(f'Dim {embedding_dim-1}')
+            x_labels_values.append(embedding_dim-1)
+    else:
+        x_labels_ticks = [f'Dim {j}' for j in range(embedding_dim)]
+        x_labels_values = list(range(embedding_dim))
+
+
+    fig = go.Figure(data=go.Heatmap(
+        z=embedding_matrix_np,
+        # x=x_labels, # Using all labels can be too dense for large embedding_dim
         y=y_labels,
         colorscale=colorscale,
-        colorbar=dict(title='Attention Weight'),
+        colorbar=dict(title='Embedding Value'),
         xgap=0, ygap=0
     ))
     fig.update_layout(
         title=title,
-        xaxis_title="Source Sequence Elements (Key/Value)",
-        yaxis_title="Target Sequence Elements (Query)",
+        xaxis_title="Embedding Dimension",
+        yaxis_title="Sequence Element",
         xaxis_tickangle=-45,
-        yaxis_autorange='reversed',
-        # --- Additions for square aspect ratio ---
-        yaxis=dict(
-            scaleanchor="x",  # Anchor y-axis scaling to x-axis
-            scaleratio=1,     # Set the ratio of y-axis units to x-axis units to 1
-            # Ensure autorange or other settings don't conflict if previously set directly on yaxis
-            # For example, if yaxis_autorange was here, it's fine.
-            # If other specific yaxis dict keys were here, they would remain.
-            autorange='reversed' # Keep this if it was intended (it was)
-        ),
-        xaxis=dict(
-            # No specific changes needed for xaxis usually, but ensure it's consistent
-            # if you had specific constraints.
-            constrain='domain' # This can help if there are multiple subplots, not strictly necessary for single plot squareness
-        ),
-        # --- End of additions for square aspect ratio ---
+        #xaxis=dict(tickmode='array', tickvals=x_labels_values, ticktext=x_labels_ticks),
         margin=dict(l=100, r=20, b=120, t=50),
-        # Keep existing aspectmode if you were using one, though scaleanchor is more direct for heatmaps
-        # For example, if you had 'aspectmode': 'cube' for the scene in 3D plots,
-        # for 2D plots, 'scaleanchor' is the way for heatmaps.
     )
     return fig
+
 
 HelixTraceData = Tuple[List[Optional[float]], List[Optional[float]], List[Optional[float]]]
 def generate_helix_trace_data(px_values: NpArrayFloat, py_values: NpArrayFloat, pz_values: NpArrayFloat, charge_values: NpArrayInt, particle_mass: float, b_field: float, scale_factor: float, num_points_helix: int = 70, num_points_straight: int = 50) -> HelixTraceData:
@@ -475,7 +520,7 @@ def generate_helix_trace_data(px_values: NpArrayFloat, py_values: NpArrayFloat, 
             path_x = scale_factor * dir_x * current_path; path_y = scale_factor * dir_y * current_path; path_z = scale_factor * dir_z * current_path
         else:
             abs_b_field = abs(b_field)
-            if abs_b_field < 1e-9:
+            if abs_b_field < 1e-9: # Should be caught by outer if, but for safety
                 time_param = np.linspace(0, path_len_m / (config.C_LIGHT * beta), num_points_straight); current_path = config.C_LIGHT * beta * time_param
                 p_abs = particle_vec.p; dir_x = particle_vec.px / p_abs if p_abs > 1e-9 else 0; dir_y = particle_vec.py / p_abs if p_abs > 1e-9 else 0; dir_z = particle_vec.pz / p_abs if p_abs > 1e-9 else 0
                 path_x = scale_factor * dir_x * current_path; path_y = scale_factor * dir_y * current_path; path_z = scale_factor * dir_z * current_path
@@ -492,9 +537,9 @@ def generate_helix_trace_data(px_values: NpArrayFloat, py_values: NpArrayFloat, 
         helix_x.append(None); helix_y.append(None); helix_z.append(None)
     return helix_x, helix_y, helix_z
 
-def create_3d_event_display_figure(traces: List[go.Scatter3d], event_index: int, b_field: float, scale_factor: float, min_pt_cut: float, root_data_error: bool = False) -> go.Figure:
+def create_3d_event_display_figure(traces: List[go.Scatter3d], event_index: int, b_field: float, scale_factor: float, root_data_error: bool = False) -> go.Figure:
     fig = go.Figure(data=traces)
-    title = f"3D Event Display: Event {event_index} (B={b_field:.1f}T, Scale={scale_factor:.0f}, pT_min={min_pt_cut:.1f} GeV)"
+    title = f"3D Event Display: Event {event_index} (B={b_field:.1f}T, Scale={scale_factor:.0f})" # Removed pT cut from title
     if root_data_error: title = f"Error loading 3D data for Event {event_index}. Display may be incomplete."
     fig.update_layout(title=title, scene=dict(xaxis=dict(title='X (mm)', backgroundcolor="rgb(230, 230,230)", gridcolor="white", showbackground=True, zerolinecolor="white", range=[-2500, 2500]), yaxis=dict(title='Y (mm)', backgroundcolor="rgb(230, 230,230)", gridcolor="white", showbackground=True, zerolinecolor="white", range=[-2500, 2500]), zaxis=dict(title='Z (mm)', backgroundcolor="rgb(230, 230,230)", gridcolor="white", showbackground=True, zerolinecolor="white", range=[-4500, 4500]), camera=dict(up=dict(x=0, y=1, z=0), center=dict(x=0, y=0, z=0), eye=dict(x=1.25, y=1.25, z=1.25)), aspectmode='cube'), legend=dict(x=0.75, y=0.95, font=dict(size=10)), margin=dict(l=0, r=0, b=0, t=40), uirevision="persistent_view")
     fig.update_traces(marker_line_width=0, selector=dict(type='scatter3d'))
@@ -531,8 +576,20 @@ def create_app_layout() -> html.Div:
                 html.Div(style={'margin': '5px'}, children=[html.Label("Event Index (iev):", style={'fontWeight': 'bold', 'marginRight': '5px'}), dcc.Input(id='iev-input', type='number', value=config.DEFAULT_EVENT_INDEX, min=0, max=max_event_val, step=1, disabled=input_disabled, style={'padding': '5px', 'width': '80px'})]),
                 html.Div(style={'margin': '5px'}, children=[html.Label("B-Field (T):", style={'fontWeight': 'bold', 'marginRight': '5px'}), dcc.Input(id='b-field-input', type='number', value=config.DEFAULT_B_FIELD_TESLA, step=0.1, style={'padding': '5px', 'width': '80px'})]),
                 html.Div(style={'margin': '5px'}, children=[html.Label("Scale Factor:", style={'fontWeight': 'bold', 'marginRight': '5px'}), dcc.Input(id='scale-input', type='number', value=config.DEFAULT_SCALE_FACTOR, step=100, style={'padding': '5px', 'width': '80px'})]),
-                html.Div(style={'margin': '5px'}, children=[html.Label("Min Track pT (GeV):", style={'fontWeight': 'bold', 'marginRight': '5px'}), dcc.Input(id='pt-cut-input', type='number', value=config.DEFAULT_PT_CUT_GEV, min=0.0, step=0.1, style={'padding': '5px', 'width': '80px'})]),
-                html.Div(style={'margin': '10px'}, children=[dcc.Checklist(id='pandora-toggle', options=[{'label': 'Show Pandora Clusters', 'value': 'show'}], value=['show'] if config.DEFAULT_SHOW_PANDORA_CLUSTERS else [], style={'fontWeight': 'bold'})]),
+                # html.Div(style={'margin': '5px'}, children=[html.Label("Min Track pT (GeV):", style={'fontWeight': 'bold', 'marginRight': '5px'}), dcc.Input(id='pt-cut-input', type='number', value=config.DEFAULT_PT_CUT_GEV, min=0.0, step=0.1, style={'padding': '5px', 'width': '80px'})]), # Removed pt-cut-input
+                html.Div(style={'margin': '10px'}, children=[
+                    dcc.Checklist(
+                        id='display-toggle-checklist',
+                        options=[
+                            {'label': 'Show Hits', 'value': 'show_hits'},
+                            {'label': 'Show Tracks', 'value': 'show_tracks'},
+                            {'label': 'Show Pandora Clusters', 'value': 'show_pandora_clusters'}
+                        ],
+                        value=['show_hits', 'show_tracks', 'show_pandora_clusters'], # Default values
+                        inline=True, # Display options horizontally
+                        style={'fontWeight': 'bold'}
+                    )
+                ]),
             ]),
             html.Div(id='error-message-display', style={'marginTop': '10px', 'marginBottom': '10px', 'color': 'red', 'textAlign': 'center', 'minHeight': '20px', 'whiteSpace': 'pre-wrap'}),
             html.Div(id='model-inference-output-display', style={'marginTop': '10px', 'marginBottom': '10px', 'color': 'blue', 'textAlign': 'left', 'minHeight': '20px', 'whiteSpace': 'pre-wrap', 'backgroundColor': '#e6f7ff', 'padding': '10px', 'borderRadius': '5px', 'fontFamily': 'monospace', 'fontSize':'0.9em', 'maxHeight': '200px', 'overflowY':'auto'}),
@@ -540,34 +597,57 @@ def create_app_layout() -> html.Div:
                 html.Div(style={'flex': '2 1 600px', 'minWidth': '60%'}, children=[dcc.Loading(id="loading-graph", type="circle", children=[dcc.Graph(id='particle-graph-display', style={'height': '75vh', 'minHeight': '500px'})])]),
                 html.Div(style={'flex': '1 1 300px', 'minWidth': '35%', 'display': 'flex', 'flexDirection': 'column', 'gap': '15px'}, children=[
                     html.H3("Track Features (X_track) - Normalized", style={'textAlign': 'center', 'marginBlock': '5px'}),
-                    dcc.Loading(id="loading-xtrack-heatmap", type="circle", children=[dcc.Graph(id='xtrack-heatmap-display', style={'height': '36vh', 'minHeight': '250px'})]),
+                    dcc.Loading(id="loading-xtrack-heatmap", type="circle", children=[dcc.Graph(id='xtrack-heatmap-display', style={'height': '32vh', 'minHeight': '220px'})]),
                     html.H3("Cluster Features (X_cluster) - Normalized", style={'textAlign': 'center', 'marginBlock': '5px'}),
-                    dcc.Loading(id="loading-xcluster-heatmap", type="circle", children=[dcc.Graph(id='xcluster-heatmap-display', style={'height': '36vh', 'minHeight': '250px'})]),
+                    dcc.Loading(id="loading-xcluster-heatmap", type="circle", children=[dcc.Graph(id='xcluster-heatmap-display', style={'height': '32vh', 'minHeight': '220px'})]),
                 ])
             ]),
             html.Div(id='attention-heatmaps-panel', style={'marginTop': '20px', 'padding': '10px', 'border': '1px solid #ccc', 'borderRadius': '5px'}, children=[]),
+            html.Div(id='embedding-heatmaps-panel', style={'marginTop': '20px', 'padding': '10px', 'border': '1px solid #ccc', 'borderRadius': '5px', 'backgroundColor': '#f9f9f9'}, children=[]), # New panel for embeddings
         ])
     ])
 
 @app.callback(
-    [Output('particle-graph-display', 'figure'), Output('xtrack-heatmap-display', 'figure'), Output('xcluster-heatmap-display', 'figure'), Output('error-message-display', 'children'), Output('model-inference-output-display', 'children'), Output('attention-heatmaps-panel', 'children')],
-    [Input('iev-input', 'value'), Input('b-field-input', 'value'), Input('scale-input', 'value'), Input('pt-cut-input', 'value'), Input('pandora-toggle', 'value')]
+    [Output('particle-graph-display', 'figure'),
+     Output('xtrack-heatmap-display', 'figure'),
+     Output('xcluster-heatmap-display', 'figure'),
+     Output('error-message-display', 'children'),
+     Output('model-inference-output-display', 'children'),
+     Output('attention-heatmaps-panel', 'children'),
+     Output('embedding-heatmaps-panel', 'children')], # New output
+    [Input('iev-input', 'value'),
+     Input('b-field-input', 'value'),
+     Input('scale-input', 'value'),
+     # Input('pt-cut-input', 'value'), # Removed pt-cut-input
+     Input('display-toggle-checklist', 'value')] # New input for toggles
 )
-def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Optional[float], scale_factor_val: Optional[float], min_pt_cut_val: Optional[float], pandora_toggle_val: List[str]) -> Tuple[go.Figure, go.Figure, go.Figure, str, str, List[Any]]:
-    error_messages: List[str] = []; model_output_msg: str = "MLPF Model not run or no data."; attention_figures_children: List[Any] = []
+def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Optional[float], scale_factor_val: Optional[float], display_options: List[str]) -> Tuple[go.Figure, go.Figure, go.Figure, str, str, List[Any], List[Any]]: # Added List[Any] for embeddings
+    error_messages: List[str] = []; model_output_msg: str = "MLPF Model not run or no data.";
+    attention_figures_children: List[Any] = []
+    embedding_figures_children: List[Any] = [] # For new embedding heatmaps
+
     if current_event_idx is None: current_event_idx = config.DEFAULT_EVENT_INDEX
     if b_field_val is None: b_field_val = config.DEFAULT_B_FIELD_TESLA
     if scale_factor_val is None: scale_factor_val = config.DEFAULT_SCALE_FACTOR
-    if min_pt_cut_val is None: min_pt_cut_val = config.DEFAULT_PT_CUT_GEV
-    show_pandora_clusters = 'show' in pandora_toggle_val
+    # if min_pt_cut_val is None: min_pt_cut_val = config.DEFAULT_PT_CUT_GEV # Removed
+    # show_pandora_clusters = 'show' in pandora_toggle_val # Replaced by display_options
+    show_hits = 'show_hits' in display_options
+    show_tracks = 'show_tracks' in display_options
+    show_pandora_clusters = 'show_pandora_clusters' in display_options
+
+
     empty_heatmap = create_empty_heatmap_figure(); xtrack_fig = empty_heatmap; xcluster_fig = empty_heatmap
     fig_3d = go.Figure().update_layout(title="Error: Event index invalid or data unavailable.", scene=dict(xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)"))
+
     if not (0 <= current_event_idx < MAX_EVENTS_AVAILABLE):
         err = f"Event index {current_event_idx} out of range (0-{max(0,MAX_EVENTS_AVAILABLE-1)})."; error_messages.append(err)
         fig_3d.update_layout(title=f"Error: {err}")
-        return fig_3d, xtrack_fig, xcluster_fig, " ".join(error_messages), model_output_msg, []
+        return fig_3d, xtrack_fig, xcluster_fig, " ".join(error_messages), model_output_msg, [], []
 
-    mlpf_predictions: Optional[MLPFOutput] = None; attention_data: List[Tuple[str, NpArrayFloat]] = []
+    mlpf_predictions: Optional[MLPFOutput] = None
+    attention_data: List[Tuple[str, NpArrayFloat]] = []
+    embedding_data: List[Tuple[str, NpArrayFloat]] = [] # For new embeddings
+
     if mlpf_model_global and model_kwargs_global and not (parquet_data_global is None) and 'X_track' in parquet_data_global.fields and 'X_cluster' in parquet_data_global.fields and 0 <= current_event_idx < max_events_pq_global:
         try:
             x_track_event_ak = parquet_data_global['X_track'][current_event_idx]; x_cluster_event_ak = parquet_data_global['X_cluster'][current_event_idx]
@@ -575,7 +655,10 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
             x_cluster_event_np = awkward.to_numpy(x_cluster_event_ak) if len(x_cluster_event_ak) > 0 else np.empty((0,0))
             if x_track_event_np.ndim < 2 and x_track_event_np.shape != (0,0): x_track_event_np = np.atleast_2d(x_track_event_np)
             if x_cluster_event_np.ndim < 2 and x_cluster_event_np.shape != (0,0): x_cluster_event_np = np.atleast_2d(x_cluster_event_np)
-            mlpf_predictions, inference_msg, attention_data = run_mlpf_inference(mlpf_model_global, model_kwargs_global, x_track_event_np, x_cluster_event_np, config.TORCH_DEVICE)
+
+            mlpf_predictions, inference_msg, attention_data, embedding_data = run_mlpf_inference( # Unpack new embedding_data
+                mlpf_model_global, model_kwargs_global, x_track_event_np, x_cluster_event_np, config.TORCH_DEVICE
+            )
             model_output_msg = f"(Event {current_event_idx}): {inference_msg}"
             if mlpf_predictions is None: error_messages.append(f"MLPF Inference: {inference_msg}")
         except Exception as e_infer: error_messages.append(f"Error during MLPF model inference: {str(e_infer)}"); model_output_msg = f"MLPF Model Inference Failed (Event {current_event_idx}): {str(e_infer)}"
@@ -583,52 +666,56 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
     elif parquet_data_global is None or not ('X_track' in parquet_data_global.fields and 'X_cluster' in parquet_data_global.fields): model_output_msg = "Parquet data (X_track/X_cluster) not available for MLPF model."
     elif not (0 <= current_event_idx < max_events_pq_global): model_output_msg = f"Event {current_event_idx} out of range for Parquet data. MLPF model not run."
 
-    # MODIFICATION START
+    # --- Process Attention Heatmaps ---
     if attention_data:
         attention_figures_children.append(html.H3("Attention Heatmaps", style={'textAlign': 'center', 'marginTop': '20px', 'marginBottom': '10px'}))
-
         conv_id_attentions = [(name, matrix) for name, matrix in attention_data if name.startswith("conv_id")]
         conv_reg_attentions = [(name, matrix) for name, matrix in attention_data if name.startswith("conv_reg")]
-
         processed_any_attention_group = False
-
         if conv_id_attentions:
             processed_any_attention_group = True
             attention_figures_children.append(html.H4("Convolutional Identification Layers (conv_id)", style={'textAlign': 'center', 'marginTop': '15px', 'marginBottom': '5px'}))
-            conv_id_row_children = []
+            row_children = []
             for name, attn_matrix in conv_id_attentions:
-                title = f"Attention: {name} (Event {current_event_idx})"
+                title = f"Attention: {name} (Evt {current_event_idx})"
                 attn_fig = create_attention_heatmap_figure(attn_matrix, title)
-                # Style for individual graph containers within a row
-                graph_container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': '30%'} # Adjust maxWidth as needed
                 graph_style = {'height': '40vh', 'minHeight': '300px'}
-                conv_id_row_children.append(
-                    html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=graph_container_style)
-                )
-            # Row div for conv_id heatmaps
-            attention_figures_children.append(html.Div(conv_id_row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
-
+                container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': 'calc(33.33% - 10px)'}
+                row_children.append(html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=container_style))
+            attention_figures_children.append(html.Div(row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
         if conv_reg_attentions:
             processed_any_attention_group = True
             attention_figures_children.append(html.H4("Convolutional Regression Layers (conv_reg)", style={'textAlign': 'center', 'marginTop': '15px', 'marginBottom': '5px'}))
-            conv_reg_row_children = []
+            row_children = []
             for name, attn_matrix in conv_reg_attentions:
-                title = f"Attention: {name} (Event {current_event_idx})"
+                title = f"Attention: {name} (Evt {current_event_idx})"
                 attn_fig = create_attention_heatmap_figure(attn_matrix, title)
-                graph_container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': '30%'} # Adjust maxWidth as needed
                 graph_style = {'height': '40vh', 'minHeight': '300px'}
-                conv_reg_row_children.append(
-                    html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=graph_container_style)
-                )
-            # Row div for conv_reg heatmaps
-            attention_figures_children.append(html.Div(conv_reg_row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
-
-        if not processed_any_attention_group and attention_data: # attention_data had items, but none matched conv_id or conv_reg
-             attention_figures_children.append(html.P("No 'conv_id' or 'conv_reg' specific attention data captured, though other attention data might exist.", style={'textAlign': 'center'}))
-
-    else: # attention_data is empty
+                container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': 'calc(33.33% - 10px)'}
+                row_children.append(html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=container_style))
+            attention_figures_children.append(html.Div(row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
+        if not processed_any_attention_group and attention_data:
+             attention_figures_children.append(html.P("No 'conv_id' or 'conv_reg' specific attention data captured.", style={'textAlign': 'center'}))
+    else:
         attention_figures_children.append(html.P("No attention data captured or available for this event.", style={'textAlign': 'center'}))
-    # MODIFICATION END
+
+    # --- Process Embedding Heatmaps ---
+    if embedding_data:
+        embedding_figures_children.append(html.H3("Intermediate Embedding Heatmaps", style={'textAlign': 'center', 'marginTop': '20px', 'marginBottom': '10px'}))
+        embedding_row_children = []
+        for name, emb_matrix in embedding_data:
+            title = f"Embedding: {name} (Evt {current_event_idx})"
+            emb_fig = create_embedding_heatmap_figure(emb_matrix, title)
+            graph_style = {'height': '50vh', 'minHeight': '400px'} # Embeddings might be taller
+            # Allow these to take more width if fewer of them
+            container_style = {'flex': '1 1 auto', 'margin': '10px', 'minWidth': '400px', 'maxWidth': 'calc(50% - 20px)'}
+            embedding_row_children.append(
+                html.Div([dcc.Graph(figure=emb_fig, style=graph_style)], style=container_style)
+            )
+        embedding_figures_children.append(html.Div(embedding_row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
+    else:
+        embedding_figures_children.append(html.P("No intermediate embedding data captured or available for this event.", style={'textAlign': 'center'}))
+
 
     if parquet_data_global is not None and 0 <= current_event_idx < max_events_pq_global:
         try:
@@ -662,37 +749,43 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
     if event_tree_global is None or max_events_root_global == 0: error_messages.append("ROOT data not loaded or no events. 3D display unavailable."); root_data_issue_for_3d = True
     elif not (0 <= current_event_idx < max_events_root_global): error_messages.append(f"Event index {current_event_idx} out of range for ROOT data. 3D display unavailable."); root_data_issue_for_3d = True
     else:
-        all_hits_features_list: List[AkArray] = []
-        if collectionIDs_reverse_global:
-            for coll_name_from_meta in collectionIDs_reverse_global.values():
-                if coll_name_from_meta in config.HIT_COLLECTIONS_TO_PLOT and coll_name_from_meta in event_tree_global:
-                    hit_features = extract_hit_features(event_tree_global, current_event_idx, coll_name_from_meta, config.HIT_FEATURES_STD)
-                    if len(hit_features.fields) > 0 and 'position.x' in hit_features.fields and len(hit_features['position.x']) > 0: all_hits_features_list.append(hit_features)
-        if all_hits_features_list:
-            try:
-                hit_feature_matrix = awkward.concatenate(all_hits_features_list, axis=0)
-                if len(hit_feature_matrix) > 0 and all(f in hit_feature_matrix.fields for f in ['position.x', 'position.y', 'position.z', 'energy', 'subdetector']):
-                    df_hits = awkward.to_dataframe(hit_feature_matrix[['position.x', 'position.y', 'position.z', 'energy', 'subdetector']]); df_hits.rename(columns={'position.x': 'px', 'position.y': 'py', 'position.z': 'pz'}, inplace=True)
-                    df_hits["energy"] = 1000 * df_hits["energy"]; df_hits["plotsize"] = 2.0
-                    df_hits.loc[df_hits["subdetector"]==0, "plotsize"] = np.clip(2 + 2 * np.log1p(df_hits.loc[df_hits["subdetector"]==0, "energy"]/5), 1, 10)
-                    df_hits.loc[df_hits["subdetector"]==1, "plotsize"] = np.clip(2 + 2 * np.log1p(df_hits.loc[df_hits["subdetector"]==1, "energy"]/10), 1, 10)
-                    df_hits.loc[df_hits["subdetector"]==2, "plotsize"] = np.clip(2 + 2 * np.log1p(df_hits.loc[df_hits["subdetector"]==2, "energy"]*100), 1, 10)
-                    df_hits.loc[df_hits["subdetector"]==3, "plotsize"] = 3.0
-                    for subdet_idx in df_hits["subdetector"].unique():
-                        sub_df = df_hits[df_hits["subdetector"] == subdet_idx]
-                        fig_traces_3d.append(go.Scatter3d(x=np.clip(sub_df["px"], -4500, 4500), y=np.clip(sub_df["py"], -4500, 4500), z=np.clip(sub_df["pz"], -4500, 4500), mode='markers', marker=dict(size=sub_df["plotsize"], color=config.HIT_SUBDETECTOR_COLOR.get(subdet_idx, "grey"), opacity=0.7), name=config.HIT_LABELS.get(subdet_idx, "Unknown Hit")))
-                else: error_messages.append("Concatenated hit data is empty or missing essential fields.")
-            except Exception as e_concat_hits: error_messages.append(f"Error processing/plotting ROOT hits: {e_concat_hits}")
-        track_px_all, track_py_all, track_pz_all, track_charge_all, track_pt_all = extract_track_features(event_tree_global, current_event_idx, config.DEFAULT_TRACK_COLLECTION_NAME, config.DEFAULT_TRACK_STATE_BRANCH_NAME, b_field_val)
-        if track_pt_all.size > 0:
-            pt_mask = track_pt_all >= min_pt_cut_val; track_px, track_py, track_pz = track_px_all[pt_mask], track_py_all[pt_mask], track_pz_all[pt_mask]; track_charge = track_charge_all[pt_mask]
-            if track_px.size > 0:
+        if show_hits:
+            all_hits_features_list: List[AkArray] = []
+            if collectionIDs_reverse_global:
+                for coll_name_from_meta in collectionIDs_reverse_global.values():
+                    if coll_name_from_meta in config.HIT_COLLECTIONS_TO_PLOT and coll_name_from_meta in event_tree_global:
+                        hit_features = extract_hit_features(event_tree_global, current_event_idx, coll_name_from_meta, config.HIT_FEATURES_STD)
+                        if len(hit_features.fields) > 0 and 'position.x' in hit_features.fields and len(hit_features['position.x']) > 0: all_hits_features_list.append(hit_features)
+            if all_hits_features_list:
                 try:
-                    hx, hy, hz = generate_helix_trace_data(track_px, track_py, track_pz, track_charge, config.PION_MASS_GEV, b_field_val, scale_factor_val)
-                    if hx: fig_traces_3d.append(go.Scatter3d(x=hx, y=hy, z=hz, mode='lines', line=dict(color="purple", width=3), name=f"SiTrack (pT >= {min_pt_cut_val:.1f} GeV)"))
-                except Exception as e_helix: error_messages.append(f"Error generating track helices: {e_helix}")
-            elif track_px_all.size > 0 : error_messages.append(f"No tracks with pT >= {min_pt_cut_val:.1f} GeV.")
-        elif config.DEFAULT_TRACK_COLLECTION_NAME in event_tree_global: error_messages.append("No tracks processed or found for this event from ROOT.")
+                    hit_feature_matrix = awkward.concatenate(all_hits_features_list, axis=0)
+                    if len(hit_feature_matrix) > 0 and all(f in hit_feature_matrix.fields for f in ['position.x', 'position.y', 'position.z', 'energy', 'subdetector']):
+                        df_hits = awkward.to_dataframe(hit_feature_matrix[['position.x', 'position.y', 'position.z', 'energy', 'subdetector']]); df_hits.rename(columns={'position.x': 'px', 'position.y': 'py', 'position.z': 'pz'}, inplace=True)
+                        df_hits["energy"] = 1000 * df_hits["energy"]; df_hits["plotsize"] = 2.0
+                        df_hits.loc[df_hits["subdetector"]==0, "plotsize"] = np.clip(2 + 2 * np.log1p(df_hits.loc[df_hits["subdetector"]==0, "energy"]/5), 1, 10)
+                        df_hits.loc[df_hits["subdetector"]==1, "plotsize"] = np.clip(2 + 2 * np.log1p(df_hits.loc[df_hits["subdetector"]==1, "energy"]/10), 1, 10)
+                        df_hits.loc[df_hits["subdetector"]==2, "plotsize"] = np.clip(2 + 2 * np.log1p(df_hits.loc[df_hits["subdetector"]==2, "energy"]*100), 1, 10)
+                        df_hits.loc[df_hits["subdetector"]==3, "plotsize"] = 3.0
+                        for subdet_idx in df_hits["subdetector"].unique():
+                            sub_df = df_hits[df_hits["subdetector"] == subdet_idx]
+                            fig_traces_3d.append(go.Scatter3d(x=np.clip(sub_df["px"], -4500, 4500), y=np.clip(sub_df["py"], -4500, 4500), z=np.clip(sub_df["pz"], -4500, 4500), mode='markers', marker=dict(size=sub_df["plotsize"], color=config.HIT_SUBDETECTOR_COLOR.get(subdet_idx, "grey"), opacity=0.7), name=config.HIT_LABELS.get(subdet_idx, "Unknown Hit")))
+                    else: error_messages.append("Concatenated hit data is empty or missing essential fields.")
+                except Exception as e_concat_hits: error_messages.append(f"Error processing/plotting ROOT hits: {e_concat_hits}")
+
+        if show_tracks:
+            track_px_all, track_py_all, track_pz_all, track_charge_all, track_pt_all = extract_track_features(event_tree_global, current_event_idx, config.DEFAULT_TRACK_COLLECTION_NAME, config.DEFAULT_TRACK_STATE_BRANCH_NAME, b_field_val)
+            if track_pt_all.size > 0:
+                # pt_mask = track_pt_all >= min_pt_cut_val # Removed pt cut
+                # track_px, track_py, track_pz = track_px_all[pt_mask], track_py_all[pt_mask], track_pz_all[pt_mask]; track_charge = track_charge_all[pt_mask]
+                track_px, track_py, track_pz, track_charge = track_px_all, track_py_all, track_pz_all, track_charge_all # Use all tracks
+                if track_px.size > 0:
+                    try:
+                        hx, hy, hz = generate_helix_trace_data(track_px, track_py, track_pz, track_charge, config.PION_MASS_GEV, b_field_val, scale_factor_val)
+                        if hx: fig_traces_3d.append(go.Scatter3d(x=hx, y=hy, z=hz, mode='lines', line=dict(color="purple", width=3), name=f"SiTracks")) # Removed pT cut from name
+                    except Exception as e_helix: error_messages.append(f"Error generating track helices: {e_helix}")
+                # elif track_px_all.size > 0 : error_messages.append(f"No tracks with pT >= {min_pt_cut_val:.1f} GeV.") # Commented out as pT cut removed
+            elif config.DEFAULT_TRACK_COLLECTION_NAME in event_tree_global: error_messages.append("No tracks processed or found for this event from ROOT.")
+
         if show_pandora_clusters:
             df_pandora = extract_pandora_cluster_features(event_tree_global, current_event_idx, config.PANDORA_CLUSTER_COLLECTION_NAME, config.PANDORA_CLUSTER_FEATURES)
             if df_pandora is not None and not df_pandora.empty:
@@ -702,9 +795,9 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
                     fig_traces_3d.append(go.Scatter3d(x=df_pandora["x"], y=df_pandora["y"], z=df_pandora["z"], mode='markers', marker=dict(size=df_pandora["plotsize"], color=config.PANDORA_CLUSTER_COLOR, opacity=0.6), name="Pandora Clusters", text=hover_texts_pandora, hoverinfo="text+name"))
                 else: error_messages.append("Essential Pandora Cluster data (pos/energy) missing.")
             elif df_pandora is None: error_messages.append(f"'{config.PANDORA_CLUSTER_COLLECTION_NAME}' not found or error during extraction.")
-    fig_3d = create_3d_event_display_figure(fig_traces_3d, current_event_idx, b_field_val, scale_factor_val, min_pt_cut_val, root_data_issue_for_3d)
+    fig_3d = create_3d_event_display_figure(fig_traces_3d, current_event_idx, b_field_val, scale_factor_val, root_data_issue_for_3d) # Removed min_pt_cut_val
     final_error_message = " | ".join(msg for msg in error_messages if msg)
-    return fig_3d, xtrack_fig, xcluster_fig, final_error_message, model_output_msg, attention_figures_children
+    return fig_3d, xtrack_fig, xcluster_fig, final_error_message, model_output_msg, attention_figures_children, embedding_figures_children
 
 if __name__ == '__main__':
     initialize_global_data()
