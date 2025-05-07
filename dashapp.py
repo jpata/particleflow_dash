@@ -32,8 +32,8 @@ AkArray = awkward.Array # General awkward array
 # --- Configuration ---
 # Using a SimpleNamespace for cleaner access to config parameters
 config = SimpleNamespace(
-    ROOT_FILE_PATH="reco_p8_ee_tt_ecm380_1.root",
-    PARQUET_FILE_PATH="reco_p8_ee_tt_ecm380_1.parquet",
+    ROOT_FILE_PATH="data/reco_p8_ee_tt_ecm380_1.root",
+    PARQUET_FILE_PATH="data/reco_p8_ee_tt_ecm380_1.parquet",
     DEFAULT_B_FIELD_TESLA=-4.0,
     DEFAULT_SCALE_FACTOR=1000.0,
     DEFAULT_EVENT_INDEX=0,
@@ -65,7 +65,7 @@ config = SimpleNamespace(
         "position.y", "position.z", "iTheta", "energy_ecal", "energy_hcal",
         "energy_other", "num_hits", "sigma_x", "sigma_y", "sigma_z",
     ],
-    MODEL_DIR=".",
+    MODEL_DIR="data",
     TORCH_DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     HIT_LABELS={0: "Raw ECAL hit", 1: "Raw HCAL hit", 2: "Raw Muon chamber hit", 3: "Raw tracker hit"},
     HIT_SUBDETECTOR_COLOR={0: "steelblue", 1: "green", 2: "orange", 3: "red"}
@@ -497,6 +497,7 @@ def run_mlpf_inference(
 ) -> Tuple[Optional[MLPFOutput], str]:
     """Runs MLPF model inference for a single event."""
     
+    import pdb;pdb.set_trace()
     model_input_dim = model_kwargs.get("input_dim")
     if model_input_dim is None:
         return None, "input_dim not found in MODEL_KWARGS"
