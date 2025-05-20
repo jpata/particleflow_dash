@@ -614,27 +614,24 @@ def create_app_layout() -> html.Div:
      Output('error-message-display', 'children'),
      Output('model-inference-output-display', 'children'),
      Output('attention-heatmaps-panel', 'children'),
-     Output('embedding-heatmaps-panel', 'children')], # New output
+     Output('embedding-heatmaps-panel', 'children')],
     [Input('iev-input', 'value'),
      Input('b-field-input', 'value'),
      Input('scale-input', 'value'),
-     # Input('pt-cut-input', 'value'), # Removed pt-cut-input
-     Input('display-toggle-checklist', 'value')] # New input for toggles
+     Input('display-toggle-checklist', 'value')]
 )
-def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Optional[float], scale_factor_val: Optional[float], display_options: List[str]) -> Tuple[go.Figure, go.Figure, go.Figure, str, str, List[Any], List[Any]]: # Added List[Any] for embeddings
+def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Optional[float], scale_factor_val: Optional[float], display_options: List[str]) -> Tuple[go.Figure, go.Figure, go.Figure, str, str, List[Any], List[Any]]:
+    print(f"Callback triggered. Event Index: {current_event_idx}, B-Field: {b_field_val}, Scale: {scale_factor_val}, Display Options: {display_options}")
     error_messages: List[str] = []; model_output_msg: str = "MLPF Model not run or no data.";
     attention_figures_children: List[Any] = []
-    embedding_figures_children: List[Any] = [] # For new embedding heatmaps
+    embedding_figures_children: List[Any] = []
 
     if current_event_idx is None: current_event_idx = config.DEFAULT_EVENT_INDEX
     if b_field_val is None: b_field_val = config.DEFAULT_B_FIELD_TESLA
     if scale_factor_val is None: scale_factor_val = config.DEFAULT_SCALE_FACTOR
-    # if min_pt_cut_val is None: min_pt_cut_val = config.DEFAULT_PT_CUT_GEV # Removed
-    # show_pandora_clusters = 'show' in pandora_toggle_val # Replaced by display_options
     show_hits = 'show_hits' in display_options
     show_tracks = 'show_tracks' in display_options
     show_pandora_clusters = 'show_pandora_clusters' in display_options
-
 
     empty_heatmap = create_empty_heatmap_figure(); xtrack_fig = empty_heatmap; xcluster_fig = empty_heatmap
     fig_3d = go.Figure().update_layout(title="Error: Event index invalid or data unavailable.", scene=dict(xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)"))
@@ -646,7 +643,7 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
 
     mlpf_predictions: Optional[MLPFOutput] = None
     attention_data: List[Tuple[str, NpArrayFloat]] = []
-    embedding_data: List[Tuple[str, NpArrayFloat]] = [] # For new embeddings
+    embedding_data: List[Tuple[str, NpArrayFloat]] = []
 
     if mlpf_model_global and model_kwargs_global and not (parquet_data_global is None) and 'X_track' in parquet_data_global.fields and 'X_cluster' in parquet_data_global.fields and 0 <= current_event_idx < max_events_pq_global:
         try:
@@ -656,7 +653,7 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
             if x_track_event_np.ndim < 2 and x_track_event_np.shape != (0,0): x_track_event_np = np.atleast_2d(x_track_event_np)
             if x_cluster_event_np.ndim < 2 and x_cluster_event_np.shape != (0,0): x_cluster_event_np = np.atleast_2d(x_cluster_event_np)
 
-            mlpf_predictions, inference_msg, attention_data, embedding_data = run_mlpf_inference( # Unpack new embedding_data
+            mlpf_predictions, inference_msg, attention_data, embedding_data = run_mlpf_inference(
                 mlpf_model_global, model_kwargs_global, x_track_event_np, x_cluster_event_np, config.TORCH_DEVICE
             )
             model_output_msg = f"(Event {current_event_idx}): {inference_msg}"
@@ -679,7 +676,8 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
             for name, attn_matrix in conv_id_attentions:
                 title = f"Attention: {name} (Evt {current_event_idx})"
                 attn_fig = create_attention_heatmap_figure(attn_matrix, title)
-                graph_style = {'height': '40vh', 'minHeight': '300px'}
+                # MODIFIED: Standardize height for attention heatmaps
+                graph_style = {'height': '32vh', 'minHeight': '220px'}
                 container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': 'calc(33.33% - 10px)'}
                 row_children.append(html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=container_style))
             attention_figures_children.append(html.Div(row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
@@ -690,7 +688,8 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
             for name, attn_matrix in conv_reg_attentions:
                 title = f"Attention: {name} (Evt {current_event_idx})"
                 attn_fig = create_attention_heatmap_figure(attn_matrix, title)
-                graph_style = {'height': '40vh', 'minHeight': '300px'}
+                # MODIFIED: Standardize height for attention heatmaps
+                graph_style = {'height': '32vh', 'minHeight': '220px'}
                 container_style = {'flex': '1 1 auto', 'margin': '5px', 'minWidth': '300px', 'maxWidth': 'calc(33.33% - 10px)'}
                 row_children.append(html.Div([dcc.Graph(figure=attn_fig, style=graph_style)], style=container_style))
             attention_figures_children.append(html.Div(row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
@@ -706,8 +705,8 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
         for name, emb_matrix in embedding_data:
             title = f"Embedding: {name} (Evt {current_event_idx})"
             emb_fig = create_embedding_heatmap_figure(emb_matrix, title)
-            graph_style = {'height': '50vh', 'minHeight': '400px'} # Embeddings might be taller
-            # Allow these to take more width if fewer of them
+            # MODIFIED: Standardize height for embedding heatmaps
+            graph_style = {'height': '32vh', 'minHeight': '220px'}
             container_style = {'flex': '1 1 auto', 'margin': '10px', 'minWidth': '400px', 'maxWidth': 'calc(50% - 20px)'}
             embedding_row_children.append(
                 html.Div([dcc.Graph(figure=emb_fig, style=graph_style)], style=container_style)
@@ -715,7 +714,6 @@ def update_graph_and_heatmaps(current_event_idx: Optional[int], b_field_val: Opt
         embedding_figures_children.append(html.Div(embedding_row_children, style={'display': 'flex', 'flexDirection': 'row', 'flexWrap': 'wrap', 'justifyContent': 'center', 'alignItems': 'flex-start', 'marginBottom': '15px'}))
     else:
         embedding_figures_children.append(html.P("No intermediate embedding data captured or available for this event.", style={'textAlign': 'center'}))
-
 
     if parquet_data_global is not None and 0 <= current_event_idx < max_events_pq_global:
         try:
